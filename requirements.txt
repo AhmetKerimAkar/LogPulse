@@ -1,0 +1,6 @@
+pandas
+scikit-learn
+pydantic
+streamlit
+google-generativeai
+pytest
