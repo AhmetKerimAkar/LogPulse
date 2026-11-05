@@ -61,7 +61,7 @@ flowchart LR
 
 ### LLM + Kural Tabanlı Yedek Raporlama
 
-Gemini API anahtarı sağlandığında yalnızca anomali kayıtlarının hassas verileri maskelenmiş özeti Gemini 2.5 Flash ile üretilir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
+Gemini API anahtarı sağlandığında yalnızca anomali kayıtlarının hassas verileri maskelenmiş özeti Gemini 2.5 Flash ile üretilir. Gemini'ye ham log veya açık IP gönderilmez; yalnızca maskelenmiş endpoint, durum kodu ve tetiklenen kural özeti gönderilir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
 
 ### Test Edilebilir ve Modüler Tasarım
 
@@ -131,6 +131,7 @@ Beklenen test kapsamı:
 - 100 normal istekte sıfır anomali ve tekrarlı giriş denemelerinde Brute Force tespiti
 - Common/Combined Log Format ayrıştırma ve atlanan satır istatistikleri
 - Hassas veri maskeleme ve sıfır anomali raporu
+- Beş dakikalık zaman pencereli 401/403 Brute Force analizi ve kayıt bazlı tetiklenen kural açıklamaları
 
 ## 📄 Lisans
 

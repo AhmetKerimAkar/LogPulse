@@ -93,10 +93,15 @@ def _reports_to_dataframe(reports: List[AnomalyReport]) -> pd.DataFrame:
                 "Metot": log_entry.http_method,
                 "Endpoint": log_entry.endpoint,
                 "Durum": log_entry.status_code,
-                "Yanıt (ms)": log_entry.response_time_ms,
+                "Yanıt (ms)": (
+                    log_entry.response_time_ms
+                    if log_entry.response_time_ms is not None
+                    else "Kaydedilmemiş"
+                ),
                 "Anomali": "Evet" if report.is_anomaly else "Hayır",
                 "Anomali Skoru": round(report.anomaly_score, 4),
                 "Risk": report.risk_level,
+                "Tetiklenen Kural / Neden": report.triggered_rule,
             }
         )
     return pd.DataFrame(rows)
@@ -161,9 +166,16 @@ def main() -> None:
         return
 
     anomaly_count = sum(report.is_anomaly for report in reports)
-    average_response = sum(
-        report.log_entry.response_time_ms for report in reports
-    ) / len(reports)
+    measured_times = [
+        report.log_entry.response_time_ms
+        for report in reports
+        if report.log_entry.response_time_ms is not None
+    ]
+    average_response = (
+        f"{sum(measured_times) / len(measured_times):.2f} ms"
+        if measured_times
+        else "Yanıt süresi kaydedilmemiş"
+    )
     risk_order = {"Düşük": 1, "Orta": 2, "Yüksek": 3}
     highest_risk = max(
         (report.risk_level for report in reports),
@@ -173,7 +185,7 @@ def main() -> None:
     metric_columns = st.columns(5)
     metric_columns[0].metric("Toplam Log Sayısı", len(reports))
     metric_columns[1].metric("Tespit Edilen Anomali", anomaly_count)
-    metric_columns[2].metric("Ortalama Yanıt Süresi", f"{average_response:.2f} ms")
+    metric_columns[2].metric("Ortalama Yanıt Süresi", average_response)
     metric_columns[3].metric("En Yüksek Risk", highest_risk)
     metric_columns[4].metric("Atlanan / Hatalı Satır", skipped_lines)
 
@@ -186,14 +198,11 @@ def main() -> None:
     )
 
     st.subheader("⏱️ Yanıt Süresi Analizi")
-    chart_data = pd.DataFrame(
-        {
-            "Yanıt Süresi (ms)": [
-                report.log_entry.response_time_ms for report in reports
-            ]
-        }
-    )
-    st.line_chart(chart_data, width="stretch")
+    if measured_times:
+        chart_data = pd.DataFrame({"Yanıt Süresi (ms)": measured_times})
+        st.line_chart(chart_data, width="stretch")
+    else:
+        st.info("Yanıt süresi kaydedilmemiş")
 
     st.subheader("🚨 Olay Müdahale")
     if api_key.strip():

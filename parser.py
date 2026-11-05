@@ -44,12 +44,12 @@ def parse_log_file_with_stats(file_path: str) -> Tuple[List[LogEntry], int]:
                     if " HTTP/" in endpoint:
                         endpoint = endpoint.rsplit(" HTTP/", 1)[0]
                     extra_fields = (values["extra_fields"] or "").split()
-                    response_time_ms = 0.0
+                    response_time_ms = None
                     if extra_fields and "/" not in values["timestamp"]:
                         try:
                             response_time_ms = float(extra_fields[-1])
                         except ValueError:
-                            response_time_ms = 0.0
+                            response_time_ms = None
                     log_entries.append(
                         LogEntry(
                             ip_address=values["ip_address"],

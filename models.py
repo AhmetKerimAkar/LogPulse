@@ -1,6 +1,6 @@
 """LogPulse uygulamasının veri modelleri."""
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel
 
@@ -13,7 +13,7 @@ class LogEntry(BaseModel):
     http_method: str
     endpoint: str
     status_code: int
-    response_time_ms: float
+    response_time_ms: Optional[float] = None
     raw_log: str
 
 
@@ -24,3 +24,4 @@ class AnomalyReport(BaseModel):
     anomaly_score: float
     is_anomaly: bool
     risk_level: Literal["Düşük", "Orta", "Yüksek"]
+    triggered_rule: str = "Normal Trafik"

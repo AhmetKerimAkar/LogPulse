@@ -200,7 +200,7 @@ def test_parse_common_log_format_and_counts_invalid_lines(tmp_path: Path) -> Non
     assert len(entries) == 1
     assert skipped_lines == 1
     assert entries[0].endpoint == "/index.html"
-    assert entries[0].response_time_ms == 0.0
+    assert entries[0].response_time_ms is None
 
 
 def test_mask_sensitive_data_masks_credentials_and_personal_data() -> None:
@@ -215,3 +215,57 @@ def test_mask_sensitive_data_masks_credentials_and_personal_data() -> None:
     assert "abc.def.ghi" not in masked
     assert "user@example.test" not in masked
     assert "hunter2" not in masked
+
+
+def test_successful_login_requests_are_normal() -> None:
+    """Üç başarılı login isteğinin brute force alarmı üretmediğini doğrular."""
+
+    logs = [
+        parse_log_file_from_text(
+            _log_line("10.0.0.9", "/login", 200, 200.0 + index)
+        )
+        for index in range(3)
+    ]
+    reports = detect_anomalies(logs)
+
+    assert all(report.is_anomaly is False for report in reports)
+    assert all(report.risk_level == "Düşük" for report in reports)
+
+
+def test_single_favicon_not_found_is_normal() -> None:
+    """Tekil favicon 404 kaydının zararsız kabul edildiğini doğrular."""
+
+    report = detect_anomalies(
+        [parse_log_file_from_text(_log_line("10.0.0.9", "/favicon.ico", 404, 20.0))]
+    )[0]
+
+    assert report.is_anomaly is False
+    assert report.risk_level == "Düşük"
+
+
+def test_encoded_sql_injection_is_detected_on_success_response() -> None:
+    """URL kodlu SQL injection saldırısının 200 yanıtla da yakalandığını doğrular."""
+
+    report = detect_anomalies(
+        [
+            parse_log_file_from_text(
+                _log_line("10.0.0.9", "/search?q=%27%20OR%201%3D1", 200, 20.0)
+            )
+        ]
+    )[0]
+
+    assert report.is_anomaly is True
+    assert report.risk_level == "Yüksek"
+    assert "SQL Injection" in report.triggered_rule
+
+
+def test_each_anomaly_has_triggered_rule() -> None:
+    """Her anomali raporunun açıklayıcı tetikleme kuralı içerdiğini doğrular."""
+
+    reports = detect_anomalies(_make_logs())
+
+    assert all(
+        report.triggered_rule and report.triggered_rule != "Normal Trafik"
+        for report in reports
+        if report.is_anomaly
+    )
