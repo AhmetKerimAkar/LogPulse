@@ -32,7 +32,7 @@ flowchart LR
     E --> F[Isolation Forest<br/>Unsupervised Detection]
     F --> G[AnomalyReport<br/>Score + Risk Level]
     G --> H{Gemini API Key var mı?}
-    H -->|Evet| I[Gemini 1.5 Flash<br/>Incident Response]
+    H -->|Evet| I[Gemini 2.5 Flash<br/>Incident Response]
     H -->|Hayır veya API Hatası| J[Kural Tabanlı Fallback<br/>SQLi / Brute Force / Path Traversal]
     I --> K[Türkçe Olay Müdahale Raporu]
     J --> K
@@ -61,7 +61,7 @@ flowchart LR
 
 ### LLM + Kural Tabanlı Yedek Raporlama
 
-Gemini API anahtarı sağlandığında olay müdahale özeti Gemini 1.5 Flash ile üretilir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
+Gemini API anahtarı sağlandığında yalnızca anomali kayıtlarının hassas verileri maskelenmiş özeti Gemini 2.5 Flash ile üretilir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
 
 ### Test Edilebilir ve Modüler Tasarım
 
@@ -128,6 +128,9 @@ Beklenen test kapsamı:
 - Anomali raporu üretimi
 - Yüksek riskli şüpheli istek tespiti
 - SQLi ve Path Traversal fallback raporu
+- 100 normal istekte sıfır anomali ve tekrarlı giriş denemelerinde Brute Force tespiti
+- Common/Combined Log Format ayrıştırma ve atlanan satır istatistikleri
+- Hassas veri maskeleme ve sıfır anomali raporu
 
 ## 📄 Lisans
 

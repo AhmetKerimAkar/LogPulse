@@ -3,9 +3,13 @@
 from pathlib import Path
 from typing import List
 
-from analyzer import detect_anomalies, generate_incident_summary
+from analyzer import (
+    detect_anomalies,
+    generate_incident_summary,
+    mask_sensitive_data,
+)
 from models import AnomalyReport, LogEntry
-from parser import parse_log_file
+from parser import parse_log_file, parse_log_file_with_stats
 
 
 def _log_line(
@@ -147,3 +151,67 @@ def test_generate_incident_summary_handles_empty_anomalies() -> None:
     summary = generate_incident_summary([])
 
     assert "Analiz edilecek anomali tespit edilmedi." in summary
+    assert "İncelenen anomali sayısı: 0" in summary
+    assert "Sistemde herhangi bir anomali veya siber tehdit tespit edilmedi." in summary
+
+
+def test_detect_anomalies_has_no_false_positives_for_normal_traffic() -> None:
+    """Tek tip 200 OK trafiğinin yanlış alarm üretmediğini doğrular."""
+
+    logs = [
+        parse_log_file_from_text(
+            _log_line("192.168.1.1", "/home", 200, 100.0 + index % 3)
+        )
+        for index in range(100)
+    ]
+
+    assert sum(report.is_anomaly for report in detect_anomalies(logs)) == 0
+
+
+def test_detect_anomalies_marks_repeated_failed_logins_as_brute_force() -> None:
+    """Aynı IP'den gelen üç başarısız girişin tamamının işaretlendiğini doğrular."""
+
+    logs = [
+        parse_log_file_from_text(
+            _log_line("10.0.0.9", "/login", 401, 200.0 + index)
+        )
+        for index in range(3)
+    ]
+    reports = detect_anomalies(logs)
+
+    assert all(report.is_anomaly for report in reports)
+    assert all(report.risk_level == "Yüksek" for report in reports)
+    assert "Brute Force (Kaba Kuvvet) Girişimi" in generate_incident_summary(reports)
+
+
+def test_parse_common_log_format_and_counts_invalid_lines(tmp_path: Path) -> None:
+    """CLF satırlarının ve atlanan satır istatistiğinin doğru olduğunu doğrular."""
+
+    log_path = tmp_path / "combined.log"
+    log_path.write_text(
+        '127.0.0.1 - - [10/Oct/2026:13:55:36 +0300] '
+        '"GET /index.html HTTP/1.1" 200 2326\n'
+        "bozuk satır\n",
+        encoding="utf-8",
+    )
+
+    entries, skipped_lines = parse_log_file_with_stats(str(log_path))
+
+    assert len(entries) == 1
+    assert skipped_lines == 1
+    assert entries[0].endpoint == "/index.html"
+    assert entries[0].response_time_ms == 0.0
+
+
+def test_mask_sensitive_data_masks_credentials_and_personal_data() -> None:
+    """Token, e-posta ve Bearer bilgilerinin rapor verisinden çıkarıldığını doğrular."""
+
+    masked = mask_sensitive_data(
+        "https://example.test?token=abc&email=user@example.test "
+        "Authorization: Bearer abc.def.ghi password=hunter2"
+    )
+
+    assert "[MASKELENDİ]" in masked
+    assert "abc.def.ghi" not in masked
+    assert "user@example.test" not in masked
+    assert "hunter2" not in masked

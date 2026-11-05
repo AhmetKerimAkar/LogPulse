@@ -8,9 +8,13 @@ from typing import List, Optional
 import pandas as pd
 import streamlit as st
 
-from analyzer import generate_incident_summary, detect_anomalies
+from analyzer import (
+    detect_anomalies,
+    generate_incident_summary,
+    mask_sensitive_data,
+)
 from models import AnomalyReport
-from parser import parse_log_file
+from parser import parse_log_file, parse_log_file_with_stats
 
 
 logging.basicConfig(level=logging.INFO)
@@ -23,12 +27,21 @@ _SAMPLE_LOG_PATH = os.path.join(_PROJECT_ROOT, "sample.log")
 def _read_uploaded_logs(uploaded_file: object) -> List[AnomalyReport]:
     """Yüklenen log dosyasını geçici dosya üzerinden analiz eder."""
 
+    reports, _ = _read_uploaded_logs_with_stats(uploaded_file)
+    return reports
+
+
+def _read_uploaded_logs_with_stats(
+    uploaded_file: object,
+) -> tuple[List[AnomalyReport], int]:
+    """Yüklenen log dosyasını analiz ederek atlanan satırları da döndürür."""
+
     temporary_path: Optional[str] = None
     try:
         file_name = getattr(uploaded_file, "name", "uploaded.log")
         if not str(file_name).lower().endswith(".log"):
             st.error("Lütfen yalnızca .log uzantılı bir dosya yükleyin.")
-            return []
+            return [], 0
 
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -38,11 +51,11 @@ def _read_uploaded_logs(uploaded_file: object) -> List[AnomalyReport]:
             temporary_file.write(uploaded_file.getvalue())
             temporary_path = temporary_file.name
 
-        return detect_incidents_from_path(temporary_path)
+        return detect_incidents_from_path_with_stats(temporary_path)
     except (OSError, TypeError, ValueError) as error:
         logger.error("Yüklenen log dosyası işlenemedi: %s", error)
         st.error("Yüklenen dosya işlenemedi.")
-        return []
+        return [], 0
     finally:
         if temporary_path is not None:
             try:
@@ -56,6 +69,15 @@ def detect_incidents_from_path(file_path: str) -> List[AnomalyReport]:
 
     logs = parse_log_file(file_path)
     return detect_anomalies(logs)
+
+
+def detect_incidents_from_path_with_stats(
+    file_path: str,
+) -> tuple[List[AnomalyReport], int]:
+    """Log dosyasını analiz eder ve atlanan satır sayısını da döndürür."""
+
+    logs, skipped_lines = parse_log_file_with_stats(file_path)
+    return detect_anomalies(logs), skipped_lines
 
 
 def _reports_to_dataframe(reports: List[AnomalyReport]) -> pd.DataFrame:
@@ -127,12 +149,12 @@ def main() -> None:
         if uploaded_file is None:
             st.info("Analize başlamak için bir .log dosyası yükleyin.")
             return
-        reports = _read_uploaded_logs(uploaded_file)
+        reports, skipped_lines = _read_uploaded_logs_with_stats(uploaded_file)
     else:
         if not os.path.exists(_SAMPLE_LOG_PATH):
             st.error("sample.log dosyası bulunamadı.")
             return
-        reports = detect_incidents_from_path(_SAMPLE_LOG_PATH)
+        reports, skipped_lines = detect_incidents_from_path_with_stats(_SAMPLE_LOG_PATH)
 
     if not reports:
         st.warning("Geçerli log kaydı bulunamadı veya analiz sonucu boş döndü.")
@@ -148,11 +170,12 @@ def main() -> None:
         key=lambda risk: risk_order[risk],
     )
 
-    metric_columns = st.columns(4)
+    metric_columns = st.columns(5)
     metric_columns[0].metric("Toplam Log Sayısı", len(reports))
     metric_columns[1].metric("Tespit Edilen Anomali", anomaly_count)
     metric_columns[2].metric("Ortalama Yanıt Süresi", f"{average_response:.2f} ms")
     metric_columns[3].metric("En Yüksek Risk", highest_risk)
+    metric_columns[4].metric("Atlanan / Hatalı Satır", skipped_lines)
 
     st.subheader("📋 Log ve Anomali Detayları")
     data_frame = _reports_to_dataframe(reports)
@@ -173,6 +196,24 @@ def main() -> None:
     st.line_chart(chart_data, width="stretch")
 
     st.subheader("🚨 Olay Müdahale")
+    if api_key.strip():
+        st.info("Rapor yöntemi: Gemini 2.5 Flash AI")
+    else:
+        st.caption(
+            "Rapor yöntemi: Kural Tabanlı Yerel Analiz Motoru "
+            "(Yedek Mod / API Anahtarı Yok veya Hata)"
+        )
+    preview = [
+        {
+            "IP": report.log_entry.ip_address,
+            "Endpoint": mask_sensitive_data(report.log_entry.endpoint),
+            "Ham log": mask_sensitive_data(report.log_entry.raw_log),
+        }
+        for report in reports
+        if report.is_anomaly
+    ]
+    with st.expander("AI'ya Gönderilecek Maskelenmiş Veri Önizlemesi"):
+        st.json(preview)
     if st.button(
         "Olay Müdahale (Incident Response) Raporu Oluştur",
         type="primary",
