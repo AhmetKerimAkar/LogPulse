@@ -1,22 +1,15 @@
 """LogPulse Streamlit tabanlı siber güvenlik kontrol paneli."""
 
 import logging
+import importlib
 import os
+import sys
 import tempfile
-from typing import List, Optional
+from types import ModuleType
+from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-
-from analyzer import (
-    build_ai_payload,
-    detect_anomalies,
-    get_detection_breakdown,
-    generate_incident_summary,
-)
-from models import AnomalyReport
-from parser import parse_log_file, parse_log_file_with_stats
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,7 +18,102 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _SAMPLE_LOG_PATH = os.path.join(_PROJECT_ROOT, "sample.log")
 
 
-def _read_uploaded_logs(uploaded_file: object) -> List[AnomalyReport]:
+def _reload_local_module(module_name: str) -> Optional[ModuleType]:
+    """Yerel modülü canlı güncellemeleri alacak şekilde yeniden yükler."""
+
+    try:
+        module = importlib.import_module(module_name)
+        return importlib.reload(module)
+    except (ImportError, AttributeError) as error:
+        logger.error("Yerel modül yüklenemedi (%s): %s", module_name, error)
+        cached_module = sys.modules.get(module_name)
+        return cached_module if isinstance(cached_module, ModuleType) else None
+
+
+_models_module = _reload_local_module("models")
+_parser_module = _reload_local_module("parser")
+_analyzer_module = _reload_local_module("analyzer")
+
+
+def _fallback_parse_log_file(file_path: str) -> List[Any]:
+    """Parser kullanılamadığında güvenli boş kayıt listesi döndürür."""
+
+    logger.error("Parser fonksiyonu kullanılamıyor: %s", file_path)
+    return []
+
+
+def _fallback_parse_log_file_with_stats(file_path: str) -> Tuple[List[Any], int]:
+    """Parser istatistik fonksiyonu kullanılamadığında güvenli sonuç döndürür."""
+
+    logger.error("Parser istatistik fonksiyonu kullanılamıyor: %s", file_path)
+    return [], 0
+
+
+def _fallback_detect_anomalies(logs: List[Any]) -> List[Any]:
+    """Analyzer kullanılamadığında güvenli boş rapor listesi döndürür."""
+
+    logger.error("Anomali tespit fonksiyonu kullanılamıyor.")
+    return []
+
+
+def _fallback_summary(reports: List[Any], api_key: str = "") -> str:
+    """Özet fonksiyonu kullanılamadığında kullanıcıya açık hata döndürür."""
+
+    logger.error("Olay özeti fonksiyonu kullanılamıyor.")
+    return "Olay özeti oluşturulamadı; yerel analyzer modülü kullanılamıyor."
+
+
+def _fallback_breakdown(reports: List[Any]) -> dict[str, int]:
+    """Tespit kırılımı kullanılamadığında güvenli sıfır değerleri döndürür."""
+
+    return {
+        "Kural Tabanlı Tespit": 0,
+        "Sadece ML (Isolation Forest) Tespiti": 0,
+        "Hibrit (Kurallar + ML) Toplam": 0,
+    }
+
+
+def _fallback_payload(reports: List[Any]) -> str:
+    """AI payload fonksiyonu kullanılamadığında güvenli boş JSON döndürür."""
+
+    return "[]"
+
+
+def _module_callable(
+    module: Optional[ModuleType],
+    name: str,
+    fallback: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Modüldeki fonksiyonu getattr ile güvenli fallback seçerek alır."""
+
+    candidate = getattr(module, name, None) if module is not None else None
+    return candidate if callable(candidate) else fallback
+
+
+parse_log_file = _module_callable(
+    _parser_module, "parse_log_file", _fallback_parse_log_file
+)
+parse_log_file_with_stats = _module_callable(
+    _parser_module,
+    "parse_log_file_with_stats",
+    _fallback_parse_log_file_with_stats,
+)
+detect_anomalies = _module_callable(
+    _analyzer_module, "detect_anomalies", _fallback_detect_anomalies
+)
+generate_incident_summary = _module_callable(
+    _analyzer_module, "generate_incident_summary", _fallback_summary
+)
+get_detection_breakdown = _module_callable(
+    _analyzer_module, "get_detection_breakdown", _fallback_breakdown
+)
+build_ai_payload = _module_callable(
+    _analyzer_module, "build_ai_payload", _fallback_payload
+)
+AnomalyReport = getattr(_models_module, "AnomalyReport", Any)
+
+
+def _read_uploaded_logs(uploaded_file: object) -> List[Any]:
     """Yüklenen log dosyasını geçici dosya üzerinden analiz eder."""
 
     reports, _ = _read_uploaded_logs_with_stats(uploaded_file)
@@ -34,7 +122,7 @@ def _read_uploaded_logs(uploaded_file: object) -> List[AnomalyReport]:
 
 def _read_uploaded_logs_with_stats(
     uploaded_file: object,
-) -> tuple[List[AnomalyReport], int]:
+) -> tuple[List[Any], int]:
     """Yüklenen log dosyasını analiz ederek atlanan satırları da döndürür."""
 
     temporary_path: Optional[str] = None
@@ -65,7 +153,7 @@ def _read_uploaded_logs_with_stats(
                 logger.warning("Geçici dosya silinemedi: %s", error)
 
 
-def detect_incidents_from_path(file_path: str) -> List[AnomalyReport]:
+def detect_incidents_from_path(file_path: str) -> List[Any]:
     """Belirtilen log dosyasını okuyup anomali raporlarına dönüştürür."""
 
     logs = parse_log_file(file_path)
@@ -74,38 +162,59 @@ def detect_incidents_from_path(file_path: str) -> List[AnomalyReport]:
 
 def detect_incidents_from_path_with_stats(
     file_path: str,
-) -> tuple[List[AnomalyReport], int]:
+) -> tuple[List[Any], int]:
     """Log dosyasını analiz eder ve atlanan satır sayısını da döndürür."""
 
     logs, skipped_lines = parse_log_file_with_stats(file_path)
     return detect_anomalies(logs), skipped_lines
 
 
-def _reports_to_dataframe(reports: List[AnomalyReport]) -> pd.DataFrame:
+def _reports_to_dataframe(reports: List[Any]) -> pd.DataFrame:
     """Anomali raporlarını kontrol panelinde gösterilecek tabloya dönüştürür."""
 
     rows = []
     for report in reports:
-        log_entry = report.log_entry
+        log_entry = getattr(report, "log_entry", None)
+        response_time = getattr(log_entry, "response_time_ms", None)
         rows.append(
             {
-                "IP Adresi": log_entry.ip_address,
-                "Zaman": log_entry.timestamp,
-                "Metot": log_entry.http_method,
-                "Endpoint": log_entry.endpoint,
-                "Durum": log_entry.status_code,
+                "IP Adresi": getattr(log_entry, "ip_address", "Bilinmiyor"),
+                "Zaman": getattr(log_entry, "timestamp", "Bilinmiyor"),
+                "Metot": getattr(log_entry, "http_method", "Bilinmiyor"),
+                "Endpoint": getattr(log_entry, "endpoint", ""),
+                "Durum": getattr(log_entry, "status_code", 0),
                 "Yanıt (ms)": (
-                    log_entry.response_time_ms
-                    if log_entry.response_time_ms is not None
+                    response_time
+                    if response_time is not None
                     else "Kaydedilmemiş"
                 ),
-                "Anomali": "Evet" if report.is_anomaly else "Hayır",
-                "Anomali Skoru": round(report.anomaly_score, 4),
-                "Risk": report.risk_level,
-                "Tetiklenen Kural / Neden": report.triggered_rule,
+                "Anomali": "Evet" if getattr(report, "is_anomaly", False) else "Hayır",
+                "Anomali Skoru": round(getattr(report, "anomaly_score", 0.0), 4),
+                "Risk": getattr(report, "risk_level", "Düşük"),
+                "Tetiklenen Kural / Neden": getattr(
+                    report, "triggered_rule", "Normal Trafik"
+                ),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _report_log_entry(report: object) -> object:
+    """Raporun log kaydını güvenli varsayılanla döndürür."""
+
+    return getattr(report, "log_entry", None)
+
+
+def _report_is_anomaly(report: object) -> bool:
+    """Raporun anomali alanını güvenli varsayılanla okur."""
+
+    return bool(getattr(report, "is_anomaly", False))
+
+
+def _report_risk(report: object) -> str:
+    """Rapor risk seviyesini geçerli güvenli varsayılanla döndürür."""
+
+    return str(getattr(report, "risk_level", "Düşük"))
 
 
 def _risk_color(row: pd.Series) -> List[str]:
@@ -166,11 +275,11 @@ def main() -> None:
         st.warning("Geçerli log kaydı bulunamadı veya analiz sonucu boş döndü.")
         return
 
-    anomaly_count = sum(report.is_anomaly for report in reports)
+    anomaly_count = sum(_report_is_anomaly(report) for report in reports)
     measured_times = [
-        report.log_entry.response_time_ms
+        getattr(_report_log_entry(report), "response_time_ms", None)
         for report in reports
-        if report.log_entry.response_time_ms is not None
+        if getattr(_report_log_entry(report), "response_time_ms", None) is not None
     ]
     average_response = (
         f"{sum(measured_times) / len(measured_times):.2f} ms"
@@ -179,7 +288,7 @@ def main() -> None:
     )
     risk_order = {"Düşük": 1, "Orta": 2, "Yüksek": 3}
     highest_risk = max(
-        (report.risk_level for report in reports),
+        (_report_risk(report) for report in reports),
         key=lambda risk: risk_order[risk],
     )
 
