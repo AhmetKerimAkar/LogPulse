@@ -18,6 +18,8 @@ Geleneksel log inceleme süreçleri büyük hacimli erişim kayıtlarında gözd
 - Uzun veya şüpheli endpoint'leri analiz eder.
 - SQL Injection, Brute Force ve Path Traversal göstergelerini işaretler.
 - Anomalileri `Düşük`, `Orta` ve `Yüksek` risk seviyeleriyle önceliklendirir.
+- 401/403 kayıtlarını gerçek 300 saniyelik ileri kayan pencereyle değerlendirir.
+- Kural tabanlı, yalnızca ML ve hibrit tespit sayılarını ayrı gösterir.
 - Güvenlik analistleri için kanıta dayalı müdahale önerileri üretir.
 
 ## 🏗️ Sistem Mimarisi ve Veri Akışı
@@ -111,6 +113,9 @@ streamlit run app.py
 Tarayıcıda gösterilen yerel adrese gidin. Sidebar üzerinden `sample.log` dosyasını analiz edebilir, yeni bir `.log` dosyası yükleyebilir veya Gemini API Key sağlayabilirsiniz.
 
 Gemini anahtarı isteğe bağlıdır. Anahtar paylaşılmadığında kural tabanlı olay müdahale raporu kullanılır. API anahtarlarını kaynak koduna veya Git deposuna eklemeyin; yerel ortam değişkenleri ya da güvenli secret yönetimi kullanın.
+
+AI önizlemesi ve Gemini isteği aynı maskelenmiş JSON payload'ını kullanır; parola,
+token, e-posta ve URL-kodlu hassas parametreler gönderilmeden önce maskelenir.
 
 ## 🧪 Test
 

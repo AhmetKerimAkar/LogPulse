@@ -9,9 +9,10 @@ import pandas as pd
 import streamlit as st
 
 from analyzer import (
+    build_ai_payload,
     detect_anomalies,
+    get_detection_breakdown,
     generate_incident_summary,
-    mask_sensitive_data,
 )
 from models import AnomalyReport
 from parser import parse_log_file, parse_log_file_with_stats
@@ -189,6 +190,14 @@ def main() -> None:
     metric_columns[3].metric("En Yüksek Risk", highest_risk)
     metric_columns[4].metric("Atlanan / Hatalı Satır", skipped_lines)
 
+    breakdown = get_detection_breakdown(reports)
+    st.subheader("🔎 Tespit Katmanı Dağılımı")
+    st.dataframe(
+        pd.DataFrame([breakdown]),
+        width="stretch",
+        hide_index=True,
+    )
+
     st.subheader("📋 Log ve Anomali Detayları")
     data_frame = _reports_to_dataframe(reports)
     st.dataframe(
@@ -212,17 +221,9 @@ def main() -> None:
             "Rapor yöntemi: Kural Tabanlı Yerel Analiz Motoru "
             "(Yedek Mod / API Anahtarı Yok veya Hata)"
         )
-    preview = [
-        {
-            "IP": report.log_entry.ip_address,
-            "Endpoint": mask_sensitive_data(report.log_entry.endpoint),
-            "Ham log": mask_sensitive_data(report.log_entry.raw_log),
-        }
-        for report in reports
-        if report.is_anomaly
-    ]
+    preview = build_ai_payload(reports)
     with st.expander("AI'ya Gönderilecek Maskelenmiş Veri Önizlemesi"):
-        st.json(preview)
+        st.code(preview, language="json")
     if st.button(
         "Olay Müdahale (Incident Response) Raporu Oluştur",
         type="primary",

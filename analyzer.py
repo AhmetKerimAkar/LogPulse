@@ -4,9 +4,9 @@ import json
 import logging
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from statistics import median
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote_plus
 
 import pandas as pd
@@ -59,7 +59,10 @@ def _parse_timestamp(timestamp: str) -> Optional[datetime]:
 
     for format_string in ("%Y-%m-%d %H:%M:%S", "%d/%b/%Y:%H:%M:%S %z"):
         try:
-            return datetime.strptime(timestamp, format_string)
+            parsed = datetime.strptime(timestamp, format_string)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=None)
         except ValueError:
             continue
     logger.warning("Zaman damgası ayrıştırılamadı: %s", timestamp)
@@ -67,7 +70,7 @@ def _parse_timestamp(timestamp: str) -> Optional[datetime]:
 
 
 def _brute_force_window_counts(logs: List[LogEntry]) -> List[int]:
-    """Her kayıt için IP bazlı beş dakikalık başarısız giriş sayısını hesaplar."""
+    """Her başlangıç kaydı için ileriye dönük 300 saniyelik pencereyi hesaplar."""
 
     failed_by_ip: dict[str, List[Tuple[int, Optional[datetime]]]] = {}
     for index, log in enumerate(logs):
@@ -78,15 +81,18 @@ def _brute_force_window_counts(logs: List[LogEntry]) -> List[int]:
 
     counts = [0] * len(logs)
     for failures in failed_by_ip.values():
-        for index, timestamp in failures:
-            if timestamp is None:
-                counts[index] = len(failures)
-                continue
-            counts[index] = sum(
-                other_timestamp is not None
-                and abs((timestamp - other_timestamp).total_seconds()) <= 300
-                for _, other_timestamp in failures
-            )
+        ordered = sorted(
+            (item for item in failures if item[1] is not None),
+            key=lambda item: item[1],
+        )
+        for start_position, (start_index, start_time) in enumerate(ordered):
+            cluster = [
+                item for item in ordered[start_position:]
+                if (item[1] - start_time).total_seconds() <= 300
+            ]
+            if len(cluster) >= 3:
+                for cluster_index, _ in cluster:
+                    counts[cluster_index] = max(counts[cluster_index], len(cluster))
     return counts
 
 
@@ -94,9 +100,9 @@ def mask_sensitive_data(text: str) -> str:
     """URL ve log metnindeki kimlik doğrulama verilerini maskeler."""
 
     patterns = (
-        r"(?i)(token|key|password|secret|session)=([^&\s\"']+)",
+        r"(?i)(pwd|pass|passwd|password|token|key|secret|session|email|mail)=([^&\s\"']+)",
         r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
-        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        r"(?i)\b[A-Z0-9._%+-]+(?:@|%40)[A-Z0-9.-]+\.[A-Z]{2,}\b",
         r"\b(?P<first>\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b",
     )
     masked = text
@@ -142,6 +148,9 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
             if normal_times
             else 0.0
         )
+        endpoint_lengths = [len(log.endpoint) for log in logs]
+        endpoint_median = median(endpoint_lengths)
+        endpoint_std = float(pd.Series(endpoint_lengths).std(ddof=0))
 
         reports: List[AnomalyReport] = []
         for index, (log, prediction, score) in enumerate(
@@ -156,13 +165,29 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 if time_std > 0 and log.response_time_ms is not None
                 else 0.0
             )
+            endpoint_z_score = (
+                (len(log.endpoint) - endpoint_median) / endpoint_std
+                if endpoint_std > 0
+                else 0.0
+            )
             high_latency = (
                 log.status_code == 200
                 and log.response_time_ms is not None
-                and log.response_time_ms > 500
+                and log.response_time_ms > 1000
                 and z_score > 2.5
             )
-            model_candidate = prediction == -1 and numeric_score > 0 and suspicious_score > 0
+            model_candidate = (
+                prediction == -1
+                and numeric_score > 0
+                and suspicious_score == 0
+                and log.status_code == 200
+                and (
+                    (log.response_time_ms is not None
+                     and log.response_time_ms > 1000
+                     and z_score > 2.5)
+                    or abs(endpoint_z_score) > 2.5
+                )
+            )
             brute_force = log.status_code in (401, 403) and failed_count >= 3
             unauthorized = log.status_code in (401, 403)
             repeated_not_found = (
@@ -182,6 +207,11 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 )
             elif high_latency and log.status_code >= 500:
                 triggered_rule = "Yüksek Yanıt Süresi + Sunucu Hatası (500)"
+            elif model_candidate:
+                triggered_rule = (
+                    "ML Anomalisi (Isolation Forest): İstatistiksel "
+                    "yanıt süresi/istek sapması"
+                )
             elif high_latency:
                 triggered_rule = "Yüksek Yanıt Süresi (200 OK, z-score > 2.5)"
             elif log.status_code >= 500:
@@ -192,7 +222,7 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                     "5 veya daha fazla 404 yanıtı"
                 )
             elif log.status_code in (401, 403):
-                triggered_rule = f"Yetkisiz erişim ({log.status_code})"
+                triggered_rule = "Yetkisiz Erişim Denemesi (Tekil 401/403)"
             else:
                 triggered_rule = "Normal Trafik"
             is_anomaly = (
@@ -209,9 +239,7 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 if (
                     attack_rule
                     or brute_force
-                    or unauthorized
-                    or high_latency
-                    or log.status_code >= 500
+                    or (high_latency and log.status_code >= 500)
                 )
                 else "Orta" if is_anomaly else "Düşük"
             )
@@ -228,6 +256,51 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
     except (ValueError, TypeError, RuntimeError) as error:
         logger.error("Anomali analizi başarısız oldu: %s", error)
         return []
+
+
+def get_detection_breakdown(reports: List[AnomalyReport]) -> Dict[str, int]:
+    """Anomali raporlarını kural, yalnızca ML ve hibrit kategorilerine ayırır."""
+
+    anomaly_reports = [report for report in reports if report.is_anomaly]
+    ml_only = [
+        report for report in anomaly_reports
+        if report.triggered_rule.startswith("ML Anomalisi (Isolation Forest)")
+    ]
+    rule_reports = [report for report in anomaly_reports if report not in ml_only]
+    hybrid = [
+        report for report in rule_reports
+        if report.anomaly_score > 0
+    ]
+    return {
+        "Kural Tabanlı Tespit": len(rule_reports) - len(hybrid),
+        "Sadece ML (Isolation Forest) Tespiti": len(ml_only),
+        "Hibrit (Kurallar + ML) Toplam": len(hybrid),
+    }
+
+
+def build_ai_payload(reports: List[AnomalyReport]) -> str:
+    """AI önizlemesi ve Gemini isteği için aynı maskelenmiş JSON metnini üretir."""
+
+    try:
+        return json.dumps(
+            [
+                {
+                    "IP": mask_sensitive_data(report.log_entry.ip_address),
+                    "timestamp": report.log_entry.timestamp,
+                    "endpoint": mask_sensitive_data(report.log_entry.endpoint),
+                    "status_code": report.log_entry.status_code,
+                    "raw_log": mask_sensitive_data(report.log_entry.raw_log),
+                    "triggered_rule": mask_sensitive_data(report.triggered_rule),
+                }
+                for report in reports
+                if report.is_anomaly
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+    except (TypeError, ValueError) as error:
+        logger.error("AI payload oluşturulamadı: %s", error)
+        return "[]"
 
 
 def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
@@ -257,13 +330,11 @@ def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
     status_counts = Counter(
         report.log_entry.status_code for report in relevant_reports
     )
-    ip_counts = Counter(report.log_entry.ip_address for report in relevant_reports)
     findings: List[str] = []
 
     sql_reports = [
         report for report in relevant_reports
-        if _decoded_attack_rule(report.log_entry.endpoint)
-        and "SQL Injection" in _decoded_attack_rule(report.log_entry.endpoint)
+        if "SQL Injection" in report.triggered_rule
     ]
     if sql_reports:
         findings.append(
@@ -271,15 +342,11 @@ def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
             "parametreli sorgu ve giriş doğrulaması uygulanmalıdır."
         )
 
-    brute_force_ips = [
-        ip for ip, count in ip_counts.items()
-        if count >= 3
-        and sum(
-            report.log_entry.ip_address == ip
-            and report.log_entry.status_code in (401, 403)
-            for report in relevant_reports
-        ) >= 3
-    ]
+    brute_force_ips = sorted({
+        report.log_entry.ip_address
+        for report in relevant_reports
+        if "Brute Force" in report.triggered_rule
+    })
     if brute_force_ips:
         findings.append(
             "- Brute Force (Kaba Kuvvet) Girişimi: Aynı kaynaktan tekrarlanan "
@@ -290,8 +357,7 @@ def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
 
     traversal_reports = [
         report for report in relevant_reports
-        if _decoded_attack_rule(report.log_entry.endpoint)
-        and "Path Traversal" in _decoded_attack_rule(report.log_entry.endpoint)
+        if "Path Traversal" in report.triggered_rule
     ]
     if traversal_reports:
         findings.append(
@@ -301,8 +367,8 @@ def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
 
     if not findings:
         findings.append(
-            "- Belirgin SQLi, Brute Force veya Path Traversal paterni bulunmadı; "
-            "anomali kayıtları manuel olarak incelenmelidir."
+            "- Belirgin saldırı paterni bulunmadı; anomali kayıtları manuel olarak "
+            "incelenmelidir."
         )
 
     status_summary = ", ".join(
@@ -346,19 +412,7 @@ def generate_incident_summary(
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(_GEMINI_MODEL)
-        payload = json.dumps(
-            [
-                {
-                    "timestamp": report.log_entry.timestamp,
-                    "endpoint": mask_sensitive_data(report.log_entry.endpoint),
-                    "status_code": report.log_entry.status_code,
-                    "triggered_rule": mask_sensitive_data(report.triggered_rule),
-                }
-                for report in anomaly_reports
-            ],
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload = build_ai_payload(anomaly_reports)
         prompt = (
             "Aşağıdaki web erişim logu anomali raporlarını Türkçe, profesyonel "
             "bir Siber Güvenlik Olay Müdahale raporuna dönüştür. SQLi, Brute "

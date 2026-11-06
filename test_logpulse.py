@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List
 
 from analyzer import (
+    build_ai_payload,
     detect_anomalies,
     generate_incident_summary,
     mask_sensitive_data,
@@ -122,7 +123,7 @@ def test_detect_anomalies_marks_suspicious_request_high_risk() -> None:
         report for report in reports if report.log_entry.endpoint == "/login"
     )
     assert suspicious_report.is_anomaly is True
-    assert suspicious_report.risk_level == "Yüksek"
+    assert suspicious_report.risk_level == "Orta"
 
 
 def test_generate_incident_summary_uses_rule_based_fallback() -> None:
@@ -269,3 +270,132 @@ def test_each_anomaly_has_triggered_rule() -> None:
         for report in reports
         if report.is_anomaly
     )
+
+
+def _failed_login(timestamp: str) -> LogEntry:
+    """Belirtilen zamanda tekil başarısız login kaydı oluşturur."""
+
+    return LogEntry(
+        ip_address="10.0.0.20",
+        timestamp=timestamp,
+        http_method="GET",
+        endpoint="/login",
+        status_code=401,
+        response_time_ms=50.0,
+        raw_log="",
+    )
+
+
+def test_summary_does_not_infer_brute_force_from_distant_failures() -> None:
+    """Beş dakikadan uzak başarısız girişlerin özette brute force üretmediğini doğrular."""
+
+    reports = detect_anomalies([
+        _failed_login("2026-11-04 09:00:00"),
+        _failed_login("2026-11-04 12:00:00"),
+        _failed_login("2026-11-04 15:00:00"),
+    ])
+
+    assert "Brute Force" not in generate_incident_summary(reports)
+
+
+def test_eight_minute_failed_login_spread_is_not_brute_force() -> None:
+    """İlk ve son kayıt arası sekiz dakika olan kümenin işaretlenmediğini doğrular."""
+
+    reports = detect_anomalies([
+        _failed_login("2026-11-04 12:00:00"),
+        _failed_login("2026-11-04 12:04:00"),
+        _failed_login("2026-11-04 12:08:00"),
+    ])
+
+    assert all("Brute Force" not in report.triggered_rule for report in reports)
+
+
+def test_single_unauthorized_login_is_medium_risk() -> None:
+    """Tekil 401 login kaydının orta riskli olduğunu doğrular."""
+
+    report = detect_anomalies([_failed_login("2026-11-04 12:00:00")])[0]
+
+    assert report.risk_level == "Orta"
+    assert report.triggered_rule == "Yetkisiz Erişim Denemesi (Tekil 401/403)"
+
+
+def test_naive_and_timezone_log_records_are_processed_together() -> None:
+    """Saat dilimli ve saat dilimsiz kayıtların birlikte işlendiğini doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address="10.0.0.21",
+            timestamp="2026-11-04 12:00:00",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=20.0,
+            raw_log="",
+        ),
+        LogEntry(
+            ip_address="10.0.0.22",
+            timestamp="04/Nov/2026:12:01:00 +0300",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=21.0,
+            raw_log="",
+        ),
+    ]
+
+    assert len(detect_anomalies(logs)) == 2
+
+
+def test_slow_successful_request_is_detected_by_isolation_forest() -> None:
+    """Kural içermeyen aşırı yavaş 200 isteğinin yalnızca ML ile yakalandığını doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address=f"10.0.1.{index}",
+            timestamp=f"2026-11-04 20:10:{index:02d}",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=100.0 + index % 3,
+            raw_log="",
+        )
+        for index in range(100)
+    ]
+    logs.append(
+        LogEntry(
+            ip_address="10.0.1.200",
+            timestamp="2026-11-04 20:12:00",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=3500.0,
+            raw_log="",
+        )
+    )
+
+    report = detect_anomalies(logs)[-1]
+
+    assert report.is_anomaly is True
+    assert report.risk_level == "Orta"
+    assert report.triggered_rule.startswith("ML Anomalisi (Isolation Forest)")
+
+
+def test_masked_ai_payload_matches_preview_data() -> None:
+    """URL kodlu e-posta ve parola maskelenmesini ve ortak payload üretimini doğrular."""
+
+    report = detect_anomalies([
+        LogEntry(
+            ip_address="10.0.0.23",
+            timestamp="2026-11-04 12:00:00",
+            http_method="GET",
+            endpoint="/login?pwd=demo-secret&email=user%40example.com",
+            status_code=401,
+            response_time_ms=20.0,
+            raw_log="GET /login?pwd=demo-secret&email=user%40example.com",
+        )
+    ])[0]
+
+    payload = build_ai_payload([report])
+    assert "demo-secret" not in payload
+    assert "user%40example.com" not in payload
+    assert payload == build_ai_payload([report])

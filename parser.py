@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import List, Tuple
 
 from models import LogEntry
@@ -14,6 +15,18 @@ _LOG_PATTERN = re.compile(
     r'"(?P<http_method>[A-Z]+)\s+(?P<endpoint>.+)"\s+'
     r'(?P<status_code>\d{3})(?:\s+(?P<extra_fields>.*))?$'
 )
+
+
+def _normalize_timestamp(timestamp: str) -> str:
+    """Saat dilimli zaman damgasını UTC saat dilimsiz biçime dönüştürür."""
+
+    try:
+        parsed = datetime.strptime(timestamp, "%d/%b/%Y:%H:%M:%S %z")
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None).strftime(
+            "%d/%b/%Y:%H:%M:%S"
+        )
+    except ValueError:
+        return timestamp
 
 
 def parse_log_file(file_path: str) -> List[LogEntry]:
@@ -53,7 +66,7 @@ def parse_log_file_with_stats(file_path: str) -> Tuple[List[LogEntry], int]:
                     log_entries.append(
                         LogEntry(
                             ip_address=values["ip_address"],
-                            timestamp=values["timestamp"],
+                            timestamp=_normalize_timestamp(values["timestamp"]),
                             http_method=values["http_method"],
                             endpoint=endpoint,
                             status_code=int(values["status_code"]),
