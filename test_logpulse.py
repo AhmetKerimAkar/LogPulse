@@ -2,10 +2,13 @@
 
 from pathlib import Path
 from typing import List
+from unittest.mock import patch
 
+import analyzer
 from analyzer import (
     build_ai_payload,
     detect_anomalies,
+    get_detection_breakdown,
     generate_incident_summary,
     mask_sensitive_data,
 )
@@ -398,4 +401,167 @@ def test_masked_ai_payload_matches_preview_data() -> None:
     payload = build_ai_payload([report])
     assert "demo-secret" not in payload
     assert "user%40example.com" not in payload
+    assert "raw_log" not in payload
     assert payload == build_ai_payload([report])
+
+
+def test_clf_file_to_summary_detects_brute_force(tmp_path: Path) -> None:
+    """CLF dosyasından üretilen raporda üç login denemesinin tamamını doğrular."""
+
+    log_path = tmp_path / "brute-force.log"
+    log_path.write_text(
+        "\n".join(
+            f'10.0.0.30 - - [07/Nov/2026:12:0{minute}:00 +0000] '
+            f'"POST /login HTTP/1.1" 401 120'
+            for minute in range(3)
+        ),
+        encoding="utf-8",
+    )
+
+    reports = detect_anomalies(parse_log_file(str(log_path)))
+
+    assert len(reports) == 3
+    assert all(report.is_anomaly for report in reports)
+    assert all(report.risk_level == "Yüksek" for report in reports)
+    assert all("Brute Force" in report.triggered_rule for report in reports)
+    assert "Brute Force" in generate_incident_summary(reports)
+
+
+def test_unrelated_unauthorized_requests_are_not_brute_force(tmp_path: Path) -> None:
+    """Kimlik doğrulama dışı üç 401 isteğinin brute force olmadığını doğrular."""
+
+    log_path = tmp_path / "orders.log"
+    log_path.write_text(
+        "\n".join(
+            f'10.0.0.31 - - [07/Nov/2026:12:0{minute}:00 +0000] '
+            f'"GET /orders HTTP/1.1" 401 120'
+            for minute in range(3)
+        ),
+        encoding="utf-8",
+    )
+
+    reports = detect_anomalies(parse_log_file(str(log_path)))
+
+    assert all("Brute Force" not in report.triggered_rule for report in reports)
+    assert all(report.risk_level == "Orta" for report in reports)
+
+
+def test_404_scan_requires_five_minute_window(tmp_path: Path) -> None:
+    """404 taramasının yalnızca beş dakikalık pencere içinde işaretlendiğini doğrular."""
+
+    spread_path = tmp_path / "spread-404.log"
+    spread_path.write_text(
+        "\n".join(
+            f'10.0.0.32 - - [07/Nov/2026:{hour:02d}:00:00 +0000] '
+            f'"GET /missing-{hour} HTTP/1.1" 404 120'
+            for hour in range(5)
+        ),
+        encoding="utf-8",
+    )
+    clustered_path = tmp_path / "clustered-404.log"
+    clustered_path.write_text(
+        "\n".join(
+            f'10.0.0.32 - - [07/Nov/2026:12:0{minute}:00 +0000] '
+            f'"GET /missing-{minute} HTTP/1.1" 404 120'
+            for minute in range(5)
+        ),
+        encoding="utf-8",
+    )
+
+    spread_reports = detect_anomalies(parse_log_file(str(spread_path)))
+    clustered_reports = detect_anomalies(parse_log_file(str(clustered_path)))
+
+    assert all("tarama" not in report.triggered_rule for report in spread_reports)
+    assert all("5 dk içinde 5" in report.triggered_rule for report in clustered_reports)
+
+
+def test_slow_success_is_ml_only_and_normal_model_is_not_anomaly() -> None:
+    """Saf gecikmenin kural değil ML katkısı olduğunu ve normal modelde alarm vermediğini doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address=f"10.0.2.{index}",
+            timestamp=f"2026-11-07 12:00:{index:02d}",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=100.0,
+            raw_log="",
+        )
+        for index in range(100)
+    ]
+    logs.append(
+        LogEntry(
+            ip_address="10.0.2.200",
+            timestamp="2026-11-07 12:02:00",
+            http_method="GET",
+            endpoint="/home",
+            status_code=200,
+            response_time_ms=3500.0,
+            raw_log="",
+        )
+    )
+
+    report = detect_anomalies(logs)[-1]
+    assert report.ml_flagged is True
+    assert report.rule_flagged is False
+    assert report.is_anomaly is True
+    assert get_detection_breakdown([report]) == {
+        "Kural Tabanlı Tespit": 0,
+        "Sadece ML (Isolation Forest) Tespiti": 1,
+        "Hibrit (Kurallar + ML) Toplam": 1,
+    }
+
+    class NormalModel:
+        """Test için tüm kayıtları normal kabul eden model taklidi."""
+
+        def fit_predict(self, data: object) -> List[int]:
+            """Tüm kayıtlar için normal tahmin döndürür."""
+
+            return [1] * len(data)  # type: ignore[arg-type]
+
+        def decision_function(self, data: object) -> List[float]:
+            """Tüm kayıtlar için sıfır anomali skoru döndürür."""
+
+            return [0.0] * len(data)  # type: ignore[arg-type]
+
+    with patch.object(analyzer, "IsolationForest", return_value=NormalModel()):
+        normal_report = detect_anomalies(logs)[-1]
+
+    assert normal_report.is_anomaly is False
+    assert normal_report.rule_flagged is False
+    assert normal_report.ml_flagged is False
+
+
+def test_ai_payload_contains_only_structured_masked_fields() -> None:
+    """AI payload'ının ham log yerine yapısal ve maskelenmiş alanlar içerdiğini doğrular."""
+
+    report = detect_anomalies([
+        LogEntry(
+            ip_address="192.168.10.22",
+            timestamp="2026-11-07 12:00:00",
+            http_method="POST",
+            endpoint="/login?password=hunter2",
+            status_code=401,
+            response_time_ms=20.0,
+            raw_log="SECRET RAW LOG password=hunter2",
+        )
+    ])[0]
+
+    payload = build_ai_payload([report])
+
+    assert "raw_log" not in payload
+    assert "SECRET RAW LOG" not in payload
+    assert "hunter2" not in payload
+    assert all(
+        field in payload
+        for field in (
+            "timestamp",
+            "IP",
+            "method",
+            "endpoint",
+            "status_code",
+            "risk_level",
+            "triggered_rule",
+        )
+    )

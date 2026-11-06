@@ -3,7 +3,7 @@
 import logging
 import re
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from models import LogEntry
 
@@ -17,16 +17,34 @@ _LOG_PATTERN = re.compile(
 )
 
 
+def parse_timestamp(ts_str: str) -> Optional[datetime]:
+    """ISO veya CLF zaman damgasını UTC saat dilimsiz datetime nesnesine çevirir."""
+
+    for format_string in (
+        "%Y-%m-%d %H:%M:%S",
+        "%d/%b/%Y:%H:%M:%S %z",
+        "%d/%b/%Y:%H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(ts_str, format_string)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            continue
+    logger.warning("Zaman damgası ayrıştırılamadı: %s", ts_str)
+    return None
+
+
 def _normalize_timestamp(timestamp: str) -> str:
     """Saat dilimli zaman damgasını UTC saat dilimsiz biçime dönüştürür."""
 
-    try:
-        parsed = datetime.strptime(timestamp, "%d/%b/%Y:%H:%M:%S %z")
-        return parsed.astimezone(timezone.utc).replace(tzinfo=None).strftime(
-            "%d/%b/%Y:%H:%M:%S"
-        )
-    except ValueError:
-        return timestamp
+    parsed = parse_timestamp(timestamp)
+    return (
+        parsed.strftime("%d/%b/%Y:%H:%M:%S")
+        if parsed is not None
+        else timestamp
+    )
 
 
 def parse_log_file(file_path: str) -> List[LogEntry]:

@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from statistics import median
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote_plus
@@ -13,6 +13,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 from models import AnomalyReport, LogEntry
+from parser import parse_timestamp
 
 
 logger = logging.getLogger(__name__)
@@ -54,29 +55,17 @@ def _decoded_attack_rule(endpoint: str) -> Optional[str]:
     return None
 
 
-def _parse_timestamp(timestamp: str) -> Optional[datetime]:
-    """Sample ve CLF zaman damgalarını datetime nesnesine dönüştürür."""
-
-    for format_string in ("%Y-%m-%d %H:%M:%S", "%d/%b/%Y:%H:%M:%S %z"):
-        try:
-            parsed = datetime.strptime(timestamp, format_string)
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone.utc)
-            return parsed.replace(tzinfo=None)
-        except ValueError:
-            continue
-    logger.warning("Zaman damgası ayrıştırılamadı: %s", timestamp)
-    return None
-
-
 def _brute_force_window_counts(logs: List[LogEntry]) -> List[int]:
     """Her başlangıç kaydı için ileriye dönük 300 saniyelik pencereyi hesaplar."""
 
     failed_by_ip: dict[str, List[Tuple[int, Optional[datetime]]]] = {}
     for index, log in enumerate(logs):
-        if log.status_code in (401, 403):
+        if (
+            log.status_code in (401, 403)
+            and _is_authentication_endpoint(log.endpoint)
+        ):
             failed_by_ip.setdefault(log.ip_address, []).append(
-                (index, _parse_timestamp(log.timestamp))
+                (index, parse_timestamp(log.timestamp))
             )
 
     counts = [0] * len(logs)
@@ -94,6 +83,51 @@ def _brute_force_window_counts(logs: List[LogEntry]) -> List[int]:
                 for cluster_index, _ in cluster:
                     counts[cluster_index] = max(counts[cluster_index], len(cluster))
     return counts
+
+
+def _is_authentication_endpoint(endpoint: str) -> bool:
+    """Endpoint'in kimlik doğrulama akışına ait olup olmadığını belirler."""
+
+    path = endpoint.split("?", 1)[0].lower().rstrip("/")
+    auth_paths = (
+        "/login",
+        "/signin",
+        "/auth",
+        "/token",
+        "/session",
+        "/admin",
+        "/wp-login",
+        "/api/auth",
+    )
+    return path == auth_paths[0] or any(
+        path == auth_path or path.startswith(f"{auth_path}/")
+        for auth_path in auth_paths[1:]
+    )
+
+
+def _not_found_window_count(logs: List[LogEntry], target: LogEntry) -> int:
+    """Aynı IP için hedef 404 kaydının bulunduğu 300 saniyelik kümeyi sayar."""
+
+    timestamps = [
+        parse_timestamp(log.timestamp)
+        for log in logs
+        if log.ip_address == target.ip_address and log.status_code == 404
+    ]
+    target_time = parse_timestamp(target.timestamp)
+    if target_time is None:
+        return 0
+    valid_times = sorted(time for time in timestamps if time is not None)
+    max_count = 0
+    for start_time in valid_times:
+        count = sum(
+            0 <= (candidate - start_time).total_seconds() <= 300
+            for candidate in valid_times
+        )
+        if start_time <= target_time and (
+            target_time - start_time
+        ).total_seconds() <= 300:
+            max_count = max(max_count, count)
+    return max_count
 
 
 def mask_sensitive_data(text: str) -> str:
@@ -137,7 +171,7 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
         brute_force_counts = _brute_force_window_counts(logs)
         model = IsolationForest(contamination="auto", random_state=42)
         predictions = model.fit_predict(data_frame)
-        model_scores = -model.decision_function(data_frame)
+        model_scores = -pd.Series(model.decision_function(data_frame)).to_numpy()
         normal_times = [
             log.response_time_ms for log in logs if log.status_code == 200
             and log.response_time_ms is not None
@@ -171,9 +205,9 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 else 0.0
             )
             high_latency = (
-                log.status_code == 200
+                log.status_code >= 500
                 and log.response_time_ms is not None
-                and log.response_time_ms > 1000
+                and log.response_time_ms >= 2000
                 and z_score > 2.5
             )
             model_candidate = (
@@ -188,24 +222,48 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                     or abs(endpoint_z_score) > 2.5
                 )
             )
-            brute_force = log.status_code in (401, 403) and failed_count >= 3
+            brute_force = (
+                log.status_code in (401, 403)
+                and _is_authentication_endpoint(log.endpoint)
+                and failed_count >= 3
+            )
             unauthorized = log.status_code in (401, 403)
             repeated_not_found = (
                 log.status_code == 404
-                and sum(
-                    other.ip_address == log.ip_address
-                    and other.status_code == 404
-                    for other in logs
-                ) >= 5
+                and _not_found_window_count(logs, log) >= 5
             )
+            rule_flagged = (
+                attack_rule is not None
+                or brute_force
+                or high_latency
+                or log.status_code >= 500
+                or repeated_not_found
+                or unauthorized
+            )
+            ml_flagged = model_candidate
             if attack_rule:
                 triggered_rule = attack_rule
             elif brute_force:
+                auth_endpoints = sorted({
+                    item.endpoint
+                    for item in logs
+                    if item.ip_address == log.ip_address
+                    and item.status_code in (401, 403)
+                    and _is_authentication_endpoint(item.endpoint)
+                })
+                auth_statuses = sorted({
+                    item.status_code
+                    for item in logs
+                    if item.ip_address == log.ip_address
+                    and item.status_code in (401, 403)
+                    and _is_authentication_endpoint(item.endpoint)
+                })
                 triggered_rule = (
                     f"Brute Force: {log.ip_address} adresinden 5 dk içinde "
-                    f"{failed_count} adet {log.status_code} başarısız giriş"
+                    f"{failed_count} adet {', '.join(map(str, auth_statuses))} "
+                    f"başarısız giriş ({', '.join(auth_endpoints)})"
                 )
-            elif high_latency and log.status_code >= 500:
+            elif high_latency:
                 triggered_rule = "Yüksek Yanıt Süresi + Sunucu Hatası (500)"
             elif model_candidate:
                 triggered_rule = (
@@ -219,7 +277,7 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
             elif repeated_not_found:
                 triggered_rule = (
                     f"Tekrarlı 404 taraması: {log.ip_address} adresinden "
-                    "5 veya daha fazla 404 yanıtı"
+                    "5 dk içinde 5 veya daha fazla 404 yanıtı"
                 )
             elif log.status_code in (401, 403):
                 triggered_rule = "Yetkisiz Erişim Denemesi (Tekil 401/403)"
@@ -230,9 +288,8 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 or model_candidate
                 or brute_force
                 or unauthorized
-                or high_latency
-                or log.status_code >= 500
-                or repeated_not_found
+                or rule_flagged
+                or ml_flagged
             )
             risk_level = (
                 "Yüksek"
@@ -250,6 +307,8 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                     is_anomaly=is_anomaly,
                     risk_level=risk_level,
                     triggered_rule=triggered_rule,
+                    rule_flagged=rule_flagged,
+                    ml_flagged=ml_flagged,
                 )
             )
         return reports
@@ -261,20 +320,19 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
 def get_detection_breakdown(reports: List[AnomalyReport]) -> Dict[str, int]:
     """Anomali raporlarını kural, yalnızca ML ve hibrit kategorilerine ayırır."""
 
-    anomaly_reports = [report for report in reports if report.is_anomaly]
+    rule_reports = [report for report in reports if report.rule_flagged]
     ml_only = [
-        report for report in anomaly_reports
-        if report.triggered_rule.startswith("ML Anomalisi (Isolation Forest)")
+        report for report in reports
+        if report.ml_flagged and not report.rule_flagged
     ]
-    rule_reports = [report for report in anomaly_reports if report not in ml_only]
-    hybrid = [
-        report for report in rule_reports
-        if report.anomaly_score > 0
+    combined = [
+        report for report in reports
+        if report.rule_flagged or report.ml_flagged
     ]
     return {
-        "Kural Tabanlı Tespit": len(rule_reports) - len(hybrid),
+        "Kural Tabanlı Tespit": len(rule_reports),
         "Sadece ML (Isolation Forest) Tespiti": len(ml_only),
-        "Hibrit (Kurallar + ML) Toplam": len(hybrid),
+        "Hibrit (Kurallar + ML) Toplam": len(combined),
     }
 
 
@@ -287,9 +345,10 @@ def build_ai_payload(reports: List[AnomalyReport]) -> str:
                 {
                     "IP": mask_sensitive_data(report.log_entry.ip_address),
                     "timestamp": report.log_entry.timestamp,
+                    "method": report.log_entry.http_method,
                     "endpoint": mask_sensitive_data(report.log_entry.endpoint),
                     "status_code": report.log_entry.status_code,
-                    "raw_log": mask_sensitive_data(report.log_entry.raw_log),
+                    "risk_level": report.risk_level,
                     "triggered_rule": mask_sensitive_data(report.triggered_rule),
                 }
                 for report in reports
@@ -342,16 +401,21 @@ def _rule_based_summary(anomalies: List[AnomalyReport]) -> str:
             "parametreli sorgu ve giriş doğrulaması uygulanmalıdır."
         )
 
-    brute_force_ips = sorted({
-        report.log_entry.ip_address
-        for report in relevant_reports
-        if "Brute Force" in report.triggered_rule
-    })
-    if brute_force_ips:
+    brute_force_reports = [
+        report for report in relevant_reports if "Brute Force" in report.triggered_rule
+    ]
+    if brute_force_reports:
+        brute_force_ips = sorted({
+            report.log_entry.ip_address for report in brute_force_reports
+        })
+        brute_force_evidence = sorted({
+            f"{report.log_entry.status_code} {report.log_entry.endpoint}"
+            for report in brute_force_reports
+        })
         findings.append(
             "- Brute Force (Kaba Kuvvet) Girişimi: Aynı kaynaktan tekrarlanan "
-            "401 /login yetkisiz erişim denemeleri "
-            f"({', '.join(brute_force_ips)}); hesap kilitleme ve oran sınırlama "
+            f"yetkisiz erişim denemeleri ({', '.join(brute_force_evidence)}; "
+            f"IP: {', '.join(brute_force_ips)}); hesap kilitleme ve oran sınırlama "
             "uygulanmalıdır."
         )
 

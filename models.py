@@ -25,3 +25,5 @@ class AnomalyReport(BaseModel):
     is_anomaly: bool
     risk_level: Literal["Düşük", "Orta", "Yüksek"]
     triggered_rule: str = "Normal Trafik"
+    rule_flagged: bool = False
+    ml_flagged: bool = False

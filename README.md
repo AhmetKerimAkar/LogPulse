@@ -63,7 +63,7 @@ flowchart LR
 
 ### LLM + Kural Tabanlı Yedek Raporlama
 
-Gemini API anahtarı sağlandığında yalnızca anomali kayıtlarının hassas verileri maskelenmiş özeti Gemini 2.5 Flash ile üretilir. Gemini'ye ham log veya açık IP gönderilmez; yalnızca maskelenmiş endpoint, durum kodu ve tetiklenen kural özeti gönderilir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
+Gemini API anahtarı sağlandığında Gemini 2.5 Flash'a ham log (`raw_log`) gönderilmez. Yalnızca zaman, maskelenmiş IP, HTTP metodu, maskelenmiş endpoint, durum kodu, risk seviyesi ve tetiklenen kural gibi yapısal özet alanları gönderilir. Maskeleme; IP, parola, token ve e-posta gibi belirli desenleri gizleyen yardımcı bir önlemdir, tam bir anonimleştirme veya veri kaybı önleme garantisi değildir. API anahtarı yoksa veya API çağrısı başarısız olursa sistem kesintiye uğramadan kural tabanlı raporlamaya geçer. Bu tasarım harici AI servisine bağımlılığı azaltır ve operasyonel süreklilik sağlar.
 
 ### Test Edilebilir ve Modüler Tasarım
 
