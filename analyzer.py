@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from datetime import datetime
 from statistics import median
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote_plus
 
 import pandas as pd
@@ -55,79 +55,100 @@ def _decoded_attack_rule(endpoint: str) -> Optional[str]:
     return None
 
 
-def _brute_force_window_counts(logs: List[LogEntry]) -> List[int]:
-    """Her başlangıç kaydı için ileriye dönük 300 saniyelik pencereyi hesaplar."""
-
-    failed_by_ip: dict[str, List[Tuple[int, Optional[datetime]]]] = {}
-    for index, log in enumerate(logs):
-        if (
-            log.status_code in (401, 403)
-            and _is_authentication_endpoint(log.endpoint)
-        ):
-            failed_by_ip.setdefault(log.ip_address, []).append(
-                (index, parse_timestamp(log.timestamp))
-            )
-
-    counts = [0] * len(logs)
-    for failures in failed_by_ip.values():
-        ordered = sorted(
-            (item for item in failures if item[1] is not None),
-            key=lambda item: item[1],
-        )
-        for start_position, (start_index, start_time) in enumerate(ordered):
-            cluster = [
-                item for item in ordered[start_position:]
-                if (item[1] - start_time).total_seconds() <= 300
-            ]
-            if len(cluster) >= 3:
-                for cluster_index, _ in cluster:
-                    counts[cluster_index] = max(counts[cluster_index], len(cluster))
-    return counts
-
-
-def _is_authentication_endpoint(endpoint: str) -> bool:
-    """Endpoint'in kimlik doğrulama akışına ait olup olmadığını belirler."""
+def is_auth_endpoint(
+    endpoint: str,
+    custom_auth_paths: Optional[List[str]] = None,
+) -> bool:
+    """Endpoint'in varsayılan veya kullanıcı tanımlı auth desenine uyup uymadığını belirler."""
 
     path = endpoint.split("?", 1)[0].lower().rstrip("/")
-    auth_paths = (
-        "/login",
-        "/signin",
-        "/auth",
-        "/token",
-        "/session",
-        "/admin",
-        "/wp-login",
-        "/api/auth",
+    default_paths = (
+        "/login", "/wp-login", "wp-login.php", "/api/login", "/signin",
+        "/auth", "/token", "/session", "/admin", "/oauth",
     )
-    return path == auth_paths[0] or any(
-        path == auth_path or path.startswith(f"{auth_path}/")
-        for auth_path in auth_paths[1:]
-    )
-
-
-def _not_found_window_count(logs: List[LogEntry], target: LogEntry) -> int:
-    """Aynı IP için hedef 404 kaydının bulunduğu 300 saniyelik kümeyi sayar."""
-
-    timestamps = [
-        parse_timestamp(log.timestamp)
-        for log in logs
-        if log.ip_address == target.ip_address and log.status_code == 404
+    configured_paths = [
+        item.strip().lower().split("?", 1)[0].rstrip("/")
+        for item in (custom_auth_paths or [])
+        if item.strip()
     ]
-    target_time = parse_timestamp(target.timestamp)
-    if target_time is None:
-        return 0
-    valid_times = sorted(time for time in timestamps if time is not None)
-    max_count = 0
-    for start_time in valid_times:
-        count = sum(
-            0 <= (candidate - start_time).total_seconds() <= 300
-            for candidate in valid_times
-        )
-        if start_time <= target_time and (
-            target_time - start_time
-        ).total_seconds() <= 300:
-            max_count = max(max_count, count)
-    return max_count
+    return any(pattern in path for pattern in (*default_paths, *configured_paths))
+
+
+def _window_indices(
+    entries: List[Tuple[int, datetime]],
+    threshold: int,
+) -> Tuple[Set[int], Dict[int, int]]:
+    """Sıralı IP kayıtlarında iki işaretçiyle eşik üstü pencere indekslerini bulur."""
+
+    intervals: List[Tuple[int, int, int]] = []
+    left = 0
+    for right, (_, right_time) in enumerate(entries):
+        while (
+            right_time - entries[left][1]
+        ).total_seconds() > 300:
+            left += 1
+        window_size = right - left + 1
+        if window_size >= threshold:
+            intervals.append((left, right, window_size))
+    flagged: Set[int] = set()
+    counts: Dict[int, int] = {}
+    merged: List[Tuple[int, int, int]] = []
+    for start, end, size in intervals:
+        if merged and start <= merged[-1][1] + 1:
+            previous_start, previous_end, previous_size = merged[-1]
+            merged[-1] = (
+                previous_start,
+                max(previous_end, end),
+                max(previous_size, size),
+            )
+        else:
+            merged.append((start, end, size))
+    for start, end, size in merged:
+        for position in range(start, end + 1):
+            index = entries[position][0]
+            flagged.add(index)
+            counts[index] = size
+    return flagged, counts
+
+
+def _precompute_window_flags(
+    logs: List[LogEntry],
+    custom_auth_paths: Optional[List[str]] = None,
+) -> Tuple[Set[int], Dict[int, int], Set[int], Dict[str, Tuple[Set[int], Set[str]]]]:
+    """Zamanları IP bazında bir kez sıralayıp auth ve 404 pencerelerini hesaplar."""
+
+    auth_by_ip: Dict[str, List[Tuple[int, datetime]]] = {}
+    not_found_by_ip: Dict[str, List[Tuple[int, datetime]]] = {}
+    auth_evidence: Dict[str, Tuple[Set[int], Set[str]]] = {}
+    for index, log in enumerate(logs):
+        timestamp = parse_timestamp(log.timestamp)
+        if timestamp is None:
+            continue
+        if log.status_code in (401, 403) and is_auth_endpoint(
+            log.endpoint, custom_auth_paths
+        ):
+            auth_by_ip.setdefault(log.ip_address, []).append((index, timestamp))
+            statuses, endpoints = auth_evidence.setdefault(
+                log.ip_address, (set(), set())
+            )
+            statuses.add(log.status_code)
+            endpoints.add(log.endpoint)
+        if log.status_code == 404:
+            not_found_by_ip.setdefault(log.ip_address, []).append((index, timestamp))
+
+    brute_force_indices: Set[int] = set()
+    brute_force_counts: Dict[int, int] = {}
+    scan_indices: Set[int] = set()
+    for entries in auth_by_ip.values():
+        entries.sort(key=lambda item: item[1])
+        indices, counts = _window_indices(entries, 3)
+        brute_force_indices.update(indices)
+        brute_force_counts.update(counts)
+    for entries in not_found_by_ip.values():
+        entries.sort(key=lambda item: item[1])
+        indices, _ = _window_indices(entries, 5)
+        scan_indices.update(indices)
+    return brute_force_indices, brute_force_counts, scan_indices, auth_evidence
 
 
 def mask_sensitive_data(text: str) -> str:
@@ -150,7 +171,10 @@ def mask_sensitive_data(text: str) -> str:
     return masked
 
 
-def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
+def analyze_logs(
+    logs: List[LogEntry],
+    auth_endpoints: Optional[List[str]] = None,
+) -> List[AnomalyReport]:
     """Logları Isolation Forest ile analiz ederek anomali raporları üretir."""
 
     if not logs:
@@ -168,7 +192,12 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
                 for log in logs
             ]
         )
-        brute_force_counts = _brute_force_window_counts(logs)
+        (
+            brute_force_indices,
+            brute_force_counts,
+            scan_indices,
+            auth_evidence,
+        ) = _precompute_window_flags(logs, auth_endpoints)
         model = IsolationForest(contamination="auto", random_state=42)
         predictions = model.fit_predict(data_frame)
         model_scores = -pd.Series(model.decision_function(data_frame)).to_numpy()
@@ -193,7 +222,7 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
             attack_rule = _decoded_attack_rule(log.endpoint)
             suspicious_score = _suspicious_score(log.endpoint)
             numeric_score = float(score)
-            failed_count = brute_force_counts[index]
+            failed_count = brute_force_counts.get(index, 0)
             z_score = (
                 (log.response_time_ms - time_median) / time_std
                 if time_std > 0 and log.response_time_ms is not None
@@ -224,13 +253,12 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
             )
             brute_force = (
                 log.status_code in (401, 403)
-                and _is_authentication_endpoint(log.endpoint)
-                and failed_count >= 3
+                and index in brute_force_indices
             )
             unauthorized = log.status_code in (401, 403)
             repeated_not_found = (
                 log.status_code == 404
-                and _not_found_window_count(logs, log) >= 5
+                and index in scan_indices
             )
             rule_flagged = (
                 attack_rule is not None
@@ -244,24 +272,13 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
             if attack_rule:
                 triggered_rule = attack_rule
             elif brute_force:
-                auth_endpoints = sorted({
-                    item.endpoint
-                    for item in logs
-                    if item.ip_address == log.ip_address
-                    and item.status_code in (401, 403)
-                    and _is_authentication_endpoint(item.endpoint)
-                })
-                auth_statuses = sorted({
-                    item.status_code
-                    for item in logs
-                    if item.ip_address == log.ip_address
-                    and item.status_code in (401, 403)
-                    and _is_authentication_endpoint(item.endpoint)
-                })
+                auth_statuses, auth_paths = auth_evidence.get(
+                    log.ip_address, (set(), {log.endpoint})
+                )
                 triggered_rule = (
                     f"Brute Force: {log.ip_address} adresinden 5 dk içinde "
-                    f"{failed_count} adet {', '.join(map(str, auth_statuses))} "
-                    f"başarısız giriş ({', '.join(auth_endpoints)})"
+                    f"{failed_count} adet {', '.join(map(str, sorted(auth_statuses)))} "
+                    f"başarısız giriş ({', '.join(sorted(auth_paths))})"
                 )
             elif high_latency:
                 triggered_rule = "Yüksek Yanıt Süresi + Sunucu Hatası (500)"
@@ -317,6 +334,15 @@ def detect_anomalies(logs: List[LogEntry]) -> List[AnomalyReport]:
         return []
 
 
+def detect_anomalies(
+    logs: List[LogEntry],
+    auth_endpoints: Optional[List[str]] = None,
+) -> List[AnomalyReport]:
+    """Eski analyzer API'sini koruyarak logları analiz eder."""
+
+    return analyze_logs(logs, auth_endpoints)
+
+
 def get_detection_breakdown(reports: List[AnomalyReport]) -> Dict[str, int]:
     """Anomali raporlarını kural, yalnızca ML ve hibrit kategorilerine ayırır."""
 
@@ -333,6 +359,130 @@ def get_detection_breakdown(reports: List[AnomalyReport]) -> Dict[str, int]:
         "Kural Tabanlı Tespit": len(rule_reports),
         "Sadece ML (Isolation Forest) Tespiti": len(ml_only),
         "Hibrit (Kurallar + ML) Toplam": len(combined),
+    }
+
+
+def _benchmark_entry(
+    index: int,
+    endpoint: str,
+    status_code: int,
+    response_time_ms: float,
+    ip_address: str,
+) -> LogEntry:
+    """Benchmark veri kümesi için tek bir log kaydı oluşturur."""
+
+    return LogEntry(
+        ip_address=ip_address,
+        timestamp=f"2026-11-07 12:00:{index % 60:02d}",
+        http_method="POST" if "login" in endpoint else "GET",
+        endpoint=endpoint,
+        status_code=status_code,
+        response_time_ms=response_time_ms,
+        raw_log="benchmark",
+    )
+
+
+def _benchmark_metrics(
+    predictions: List[bool],
+    labels: List[bool],
+) -> Dict[str, float]:
+    """Tahmin ve ground-truth listelerinden sınıflandırma ölçümlerini hesaplar."""
+
+    true_positive = sum(prediction and label for prediction, label in zip(predictions, labels))
+    false_positive = sum(
+        prediction and not label for prediction, label in zip(predictions, labels)
+    )
+    false_negative = sum(
+        not prediction and label for prediction, label in zip(predictions, labels)
+    )
+    true_negative = sum(
+        not prediction and not label for prediction, label in zip(predictions, labels)
+    )
+    recall = true_positive / (true_positive + false_negative) if (
+        true_positive + false_negative
+    ) else 0.0
+    precision = true_positive / (true_positive + false_positive) if (
+        true_positive + false_positive
+    ) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    fpr = false_positive / (false_positive + true_negative) if (
+        false_positive + true_negative
+    ) else 0.0
+    return {
+        "true_positive": float(true_positive),
+        "false_positive": float(false_positive),
+        "recall": recall,
+        "precision": precision,
+        "f1": f1,
+        "fpr": fpr,
+        "Yakalanan Saldırı (True Positive)": float(true_positive),
+        "Yanlış Alarm (False Positive)": float(false_positive),
+        "Yakalama Oranı (Recall %)": recall * 100,
+        "Kesinlik (Precision %)": precision * 100,
+        "F1 Skoru": f1,
+        "Yanlış Alarm Oranı (FPR %)": fpr * 100,
+    }
+
+
+def evaluate_system_benchmark() -> Dict[str, Dict[str, float]]:
+    """Etiketli saldırı kümesiyle kural, ML ve birleşik sistemi ölçer."""
+
+    logs: List[LogEntry] = []
+    labels: List[bool] = []
+    for index in range(100):
+        logs.append(_benchmark_entry(index, "/home", 200, 100.0 + index % 3, f"10.0.10.{index}"))
+        labels.append(False)
+    logs.extend([
+        _benchmark_entry(100, "/favicon.ico", 404, 20.0, "10.0.20.1"),
+        _benchmark_entry(101, "/login", 200, 100.0, "10.0.20.2"),
+        _benchmark_entry(102, "/login", 200, 101.0, "10.0.20.2"),
+    ])
+    labels.extend([False, False, False])
+
+    attack_logs: List[LogEntry] = []
+    attack_labels: List[bool] = []
+    for offset, endpoint in enumerate(("/login", "/wp-login.php", "/api/login")):
+        for attempt in range(3):
+            attack_logs.append(
+                _benchmark_entry(
+                    110 + offset * 3 + attempt,
+                    endpoint,
+                    401,
+                    120.0,
+                    f"10.0.30.{offset + 1}",
+                )
+            )
+            attack_labels.append(True)
+    attack_logs.extend([
+        _benchmark_entry(120, "/search?q=%27%20OR%201%3D1", 200, 100.0, "10.0.31.1"),
+        _benchmark_entry(121, "/../../etc/passwd", 403, 100.0, "10.0.31.2"),
+    ])
+    attack_labels.extend([True, True])
+    for attempt in range(5):
+        attack_logs.append(
+            _benchmark_entry(130 + attempt, f"/missing-{attempt}", 404, 20.0, "10.0.32.1")
+        )
+        attack_labels.append(True)
+    attack_logs.append(_benchmark_entry(140, "/home", 200, 3500.0, "10.0.33.1"))
+    attack_labels.append(True)
+    logs.extend(attack_logs)
+    labels.extend(attack_labels)
+
+    reports = analyze_logs(logs)
+    strategies = {
+        "Yalnızca Kurallar": [report.rule_flagged for report in reports],
+        "Yalnızca ML (Isolation Forest)": [report.ml_flagged for report in reports],
+        "Birleşik Sistem (Kurallar + ML)": [
+            report.rule_flagged or report.ml_flagged for report in reports
+        ],
+    }
+    return {
+        name: _benchmark_metrics(predictions, labels)
+        for name, predictions in strategies.items()
     }
 
 

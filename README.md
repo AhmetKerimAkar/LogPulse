@@ -137,6 +137,25 @@ Beklenen test kapsamı:
 - Common/Combined Log Format ayrıştırma ve atlanan satır istatistikleri
 - Hassas veri maskeleme ve sıfır anomali raporu
 - Beş dakikalık zaman pencereli 401/403 Brute Force analizi ve kayıt bazlı tetiklenen kural açıklamaları
+- Yapılandırılabilir giriş adresleri, O(N log N) kayan pencere ve etiketli benchmark ölçümleri
+
+## 📈 Doğruluk ve Performans Ölçümü (Benchmark)
+
+`evaluate_system_benchmark()` fonksiyonu; 100 normal istek, tekil favicon 404,
+başarılı login'ler, `/login`, `/wp-login.php` ve `/api/login` Brute Force
+kümeleri, kodlanmış SQLi, Path Traversal, beş dakikadaki 5+ adet 404 taraması
+ve 3500 ms 200 OK ML anomalisi içeren etiketli bir veri kümesini çalıştırır.
+Yerel ölçüm sonuçları aşağıdaki gibidir:
+
+| Sistem | TP | FP | Recall | Precision | F1 | FPR |
+|---|---:|---:|---:|---:|---:|---:|
+| Yalnızca Kurallar | 16 | 0 | 94.12% | 100.00% | 0.970 | 0.00% |
+| Yalnızca ML (Isolation Forest) | 1 | 0 | 5.88% | 100.00% | 0.111 | 0.00% |
+| Birleşik Sistem (Kurallar + ML) | 17 | 0 | 100.00% | 100.00% | 1.000 | 0.00% |
+
+404 ve auth kayıtları IP bazında bir kez sıralanır ve iki işaretçili kayan
+pencereyle işlenir. 500 aynı zaman damgalı 404 kaydı üzerinde yerel yük testi
+yaklaşık 0.1 saniyede tamamlanmıştır.
 
 ## 📄 Lisans
 

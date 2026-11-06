@@ -1,6 +1,7 @@
 """LogPulse parser ve analyzer birim testleri."""
 
 from pathlib import Path
+from time import perf_counter
 from typing import List
 from unittest.mock import patch
 
@@ -8,8 +9,10 @@ import analyzer
 from analyzer import (
     build_ai_payload,
     detect_anomalies,
+    evaluate_system_benchmark,
     get_detection_breakdown,
     generate_incident_summary,
+    is_auth_endpoint,
     mask_sensitive_data,
 )
 from models import AnomalyReport, LogEntry
@@ -565,3 +568,88 @@ def test_ai_payload_contains_only_structured_masked_fields() -> None:
             "triggered_rule",
         )
     )
+
+
+def test_extended_default_auth_endpoints_are_brute_force() -> None:
+    """WordPress ve API login yollarının varsayılan auth eşleşmesini doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address="10.0.40.1",
+            timestamp=f"2026-11-07 12:{minute:02d}:00",
+            http_method="POST",
+            endpoint=endpoint,
+            status_code=401,
+            response_time_ms=50.0,
+            raw_log="",
+        )
+        for endpoint in ("/wp-login.php", "/api/login")
+        for minute in range(3)
+    ]
+    reports = detect_anomalies(logs)
+
+    assert is_auth_endpoint("/wp-login.php")
+    assert is_auth_endpoint("/api/login")
+    assert all(report.is_anomaly for report in reports)
+    assert all(report.risk_level == "Yüksek" for report in reports)
+    assert all("Brute Force" in report.triggered_rule for report in reports)
+
+
+def test_custom_auth_endpoint_is_brute_force() -> None:
+    """Kullanıcı tanımlı auth yolunun üç başarısız denemeyi yakaladığını doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address="10.0.40.2",
+            timestamp=f"2026-11-07 12:0{index}:00",
+            http_method="POST",
+            endpoint="/v2/member-check",
+            status_code=401,
+            response_time_ms=50.0,
+            raw_log="",
+        )
+        for index in range(3)
+    ]
+
+    reports = analyzer.analyze_logs(logs, ["/v2/member-check"])
+
+    assert all("Brute Force" in report.triggered_rule for report in reports)
+    assert all(report.risk_level == "Yüksek" for report in reports)
+
+
+def test_five_hundred_404_records_use_fast_sliding_window() -> None:
+    """Aynı IP'deki 500 adet 404 kaydının kayan pencereyle hızlı işlendiğini doğrular."""
+
+    logs = [
+        LogEntry(
+            ip_address="10.0.40.3",
+            timestamp="2026-11-07 12:00:00",
+            http_method="GET",
+            endpoint=f"/missing-{index}",
+            status_code=404,
+            response_time_ms=20.0,
+            raw_log="",
+        )
+        for index in range(500)
+    ]
+
+    started = perf_counter()
+    reports = detect_anomalies(logs)
+    elapsed = perf_counter() - started
+
+    assert len(reports) == 500
+    assert all("5 dk içinde 5" in report.triggered_rule for report in reports)
+    assert elapsed < 0.5
+
+
+def test_evaluate_system_benchmark_reports_combined_quality() -> None:
+    """Etiketli benchmark'ın ölçümleri ve birleşik sistem üstünlüğünü doğrular."""
+
+    benchmark = evaluate_system_benchmark()
+    rules = benchmark["Yalnızca Kurallar"]
+    ml = benchmark["Yalnızca ML (Isolation Forest)"]
+    combined = benchmark["Birleşik Sistem (Kurallar + ML)"]
+
+    assert combined["recall"] >= rules["recall"]
+    assert combined["recall"] >= ml["recall"]
+    assert combined["fpr"] <= 0.05

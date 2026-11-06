@@ -49,11 +49,21 @@ def _fallback_parse_log_file_with_stats(file_path: str) -> Tuple[List[Any], int]
     return [], 0
 
 
-def _fallback_detect_anomalies(logs: List[Any]) -> List[Any]:
+def _fallback_detect_anomalies(
+    logs: List[Any],
+    auth_endpoints: Optional[List[str]] = None,
+) -> List[Any]:
     """Analyzer kullanılamadığında güvenli boş rapor listesi döndürür."""
 
     logger.error("Anomali tespit fonksiyonu kullanılamıyor.")
     return []
+
+
+def _fallback_benchmark() -> dict[str, dict[str, float]]:
+    """Benchmark fonksiyonu kullanılamadığında güvenli boş sonuç döndürür."""
+
+    logger.error("Benchmark fonksiyonu kullanılamıyor.")
+    return {}
 
 
 def _fallback_summary(reports: List[Any], api_key: str = "") -> str:
@@ -98,8 +108,12 @@ parse_log_file_with_stats = _module_callable(
     "parse_log_file_with_stats",
     _fallback_parse_log_file_with_stats,
 )
-detect_anomalies = _module_callable(
-    _analyzer_module, "detect_anomalies", _fallback_detect_anomalies
+analyze_logs = _module_callable(
+    _analyzer_module, "analyze_logs", _fallback_detect_anomalies
+)
+detect_anomalies = analyze_logs
+evaluate_system_benchmark = _module_callable(
+    _analyzer_module, "evaluate_system_benchmark", _fallback_benchmark
 )
 generate_incident_summary = _module_callable(
     _analyzer_module, "generate_incident_summary", _fallback_summary
@@ -113,15 +127,19 @@ build_ai_payload = _module_callable(
 AnomalyReport = getattr(_models_module, "AnomalyReport", Any)
 
 
-def _read_uploaded_logs(uploaded_file: object) -> List[Any]:
+def _read_uploaded_logs(
+    uploaded_file: object,
+    auth_endpoints: Optional[List[str]] = None,
+) -> List[Any]:
     """Yüklenen log dosyasını geçici dosya üzerinden analiz eder."""
 
-    reports, _ = _read_uploaded_logs_with_stats(uploaded_file)
+    reports, _ = _read_uploaded_logs_with_stats(uploaded_file, auth_endpoints)
     return reports
 
 
 def _read_uploaded_logs_with_stats(
     uploaded_file: object,
+    auth_endpoints: Optional[List[str]] = None,
 ) -> tuple[List[Any], int]:
     """Yüklenen log dosyasını analiz ederek atlanan satırları da döndürür."""
 
@@ -140,7 +158,7 @@ def _read_uploaded_logs_with_stats(
             temporary_file.write(uploaded_file.getvalue())
             temporary_path = temporary_file.name
 
-        return detect_incidents_from_path_with_stats(temporary_path)
+        return detect_incidents_from_path_with_stats(temporary_path, auth_endpoints)
     except (OSError, TypeError, ValueError) as error:
         logger.error("Yüklenen log dosyası işlenemedi: %s", error)
         st.error("Yüklenen dosya işlenemedi.")
@@ -153,20 +171,24 @@ def _read_uploaded_logs_with_stats(
                 logger.warning("Geçici dosya silinemedi: %s", error)
 
 
-def detect_incidents_from_path(file_path: str) -> List[Any]:
+def detect_incidents_from_path(
+    file_path: str,
+    auth_endpoints: Optional[List[str]] = None,
+) -> List[Any]:
     """Belirtilen log dosyasını okuyup anomali raporlarına dönüştürür."""
 
     logs = parse_log_file(file_path)
-    return detect_anomalies(logs)
+    return analyze_logs(logs, auth_endpoints)
 
 
 def detect_incidents_from_path_with_stats(
     file_path: str,
+    auth_endpoints: Optional[List[str]] = None,
 ) -> tuple[List[Any], int]:
     """Log dosyasını analiz eder ve atlanan satır sayısını da döndürür."""
 
     logs, skipped_lines = parse_log_file_with_stats(file_path)
-    return detect_anomalies(logs), skipped_lines
+    return analyze_logs(logs, auth_endpoints), skipped_lines
 
 
 def _reports_to_dataframe(reports: List[Any]) -> pd.DataFrame:
@@ -259,17 +281,28 @@ def main() -> None:
             type="password",
             help="Boş bırakılırsa kural tabanlı rapor üretilir.",
         )
+        custom_auth_text = st.text_input(
+            "Özel Giriş Adresleri (Brute Force)",
+            help="Birden fazla adresi virgülle ayırın; örn. /v2/member-check, /custom-login",
+        )
+    custom_auth_endpoints = [
+        item.strip() for item in custom_auth_text.split(",") if item.strip()
+    ]
 
     if source == "Yeni .log dosyası":
         if uploaded_file is None:
             st.info("Analize başlamak için bir .log dosyası yükleyin.")
             return
-        reports, skipped_lines = _read_uploaded_logs_with_stats(uploaded_file)
+        reports, skipped_lines = _read_uploaded_logs_with_stats(
+            uploaded_file, custom_auth_endpoints
+        )
     else:
         if not os.path.exists(_SAMPLE_LOG_PATH):
             st.error("sample.log dosyası bulunamadı.")
             return
-        reports, skipped_lines = detect_incidents_from_path_with_stats(_SAMPLE_LOG_PATH)
+        reports, skipped_lines = detect_incidents_from_path_with_stats(
+            _SAMPLE_LOG_PATH, custom_auth_endpoints
+        )
 
     if not reports:
         st.warning("Geçerli log kaydı bulunamadı veya analiz sonucu boş döndü.")
@@ -306,6 +339,26 @@ def main() -> None:
         width="stretch",
         hide_index=True,
     )
+    with st.expander("📊 Doğruluk ve Performans Ölçümü (Benchmark)"):
+        benchmark = evaluate_system_benchmark()
+        if benchmark:
+            benchmark_rows = [
+                {
+                    "Sistem": name,
+                    "Yakalanan Saldırı (TP)": values.get(
+                        "Yakalanan Saldırı (True Positive)", 0
+                    ),
+                    "Yanlış Alarm (FP)": values.get(
+                        "Yanlış Alarm (False Positive)", 0
+                    ),
+                    "Recall %": values.get("Yakalama Oranı (Recall %)", 0.0),
+                    "Precision %": values.get("Kesinlik (Precision %)", 0.0),
+                    "F1": values.get("F1 Skoru", 0.0),
+                    "FPR %": values.get("Yanlış Alarm Oranı (FPR %)", 0.0),
+                }
+                for name, values in benchmark.items()
+            ]
+            st.dataframe(pd.DataFrame(benchmark_rows), hide_index=True)
 
     st.subheader("📋 Log ve Anomali Detayları")
     data_frame = _reports_to_dataframe(reports)
